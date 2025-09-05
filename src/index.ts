@@ -12,6 +12,7 @@ import * as dotenv from "dotenv";
 import fs from 'fs';
 import * as fsPromises from 'fs/promises';
 import fetch from "node-fetch";
+import * as os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
@@ -96,6 +97,28 @@ const AI_PROVIDERS: Record<string, AIProvider> = {
  * Enhanced Context Management System
  * Handles conversation history, project context, and automatic context injection
  */
+// Workspace manager for handling dynamic workspace changes
+class WorkspaceManager {
+    private static instance: WorkspaceManager;
+    private currentWorkspace: string | null = null;
+    
+    static getInstance(): WorkspaceManager {
+        if (!WorkspaceManager.instance) {
+            WorkspaceManager.instance = new WorkspaceManager();
+        }
+        return WorkspaceManager.instance;
+    }
+    
+    setWorkspace(workspacePath: string): void {
+        this.currentWorkspace = workspacePath;
+        console.error(`[WORKSPACE] Set workspace to: ${workspacePath}`);
+    }
+    
+    getCurrentWorkspace(): string | null {
+        return this.currentWorkspace;
+    }
+}
+
 interface ConversationEntry {
     timestamp: Date;
     tool: string;
@@ -122,11 +145,249 @@ interface ProjectContext {
 
 class ConversationHistoryManager {
     private history: ConversationEntry[] = [];
-    private readonly HISTORY_FILE = '.mcp-conversation-history.json';
+    private readonly HISTORY_FILE: string;
     private readonly MAX_HISTORY_ENTRIES = 20;
+    private readonly MAX_AGE_HOURS = 24; // Only keep conversations from last 24 hours
+    private readonly CONTEXT_FRESHNESS_HOURS = 6; // Consider context fresh for 6 hours
 
     constructor() {
+        // SIMPLIFIED APPROACH: Use VS Code's current working directory
+        // When VS Code opens a project, it should set CWD to that project
+        const currentDir = process.cwd();
+        console.error(`[CONVERSATION] Current working directory: ${currentDir}`);
+        
+        // Check if workspace has been dynamically set
+        const dynamicWorkspace = WorkspaceManager.getInstance().getCurrentWorkspace();
+        
+        let workspaceDir: string;
+        if (dynamicWorkspace) {
+            console.error(`[CONVERSATION] Using dynamically set workspace: ${dynamicWorkspace}`);
+            workspaceDir = dynamicWorkspace;
+        } else if (currentDir !== os.homedir() && currentDir !== '/') {
+            // If CWD is not home directory or root, use it as workspace
+            console.error(`[CONVERSATION] Using current directory as workspace: ${currentDir}`);
+            workspaceDir = currentDir;
+        } else {
+            // Fall back to detection logic only if CWD is home/root
+            console.error(`[CONVERSATION] CWD is ${currentDir}, falling back to detection`);
+            workspaceDir = this.findWorkspaceDirectory();
+        }
+        
+        this.HISTORY_FILE = path.join(workspaceDir, '.mcp-conversation-history.json');
+        console.error(`[CONVERSATION] Using history file: ${this.HISTORY_FILE}`);
         this.loadHistory();
+    }
+
+    private findWorkspaceDirectory(): string {
+        console.error(`[CONVERSATION DEBUG] Starting from CWD: ${process.cwd()}`);
+        console.error(`[CONVERSATION DEBUG] Home dir: ${os.homedir()}`);
+        console.error(`[CONVERSATION DEBUG] Script path: ${process.argv[1]}`);
+        
+        // Method 1: Check VS Code workspace environment variables
+        const vscodeWorkspaceVars = [
+            'MCP_WORKSPACE_PATH',        // Custom variable we can set in mcp.json
+            'VSCODE_WORKSPACE_FOLDER',   // VS Code sometimes sets this
+            'WORKSPACE_FOLDER',          // Alternative VS Code variable
+            'VSCODE_CWD'                 // VS Code working directory (but can be wrong)
+        ];
+        
+        for (const envVar of vscodeWorkspaceVars) {
+            const workspace = process.env[envVar];
+            console.error(`[CONVERSATION DEBUG] Checking ${envVar}: ${workspace || 'undefined'}`);
+            // Skip VSCODE_CWD if it's root directory - it's clearly wrong
+            if (workspace && workspace !== os.homedir() && workspace !== '/' && fs.existsSync(workspace)) {
+                console.error(`[CONVERSATION] Found workspace via ${envVar}: ${workspace}`);
+                return workspace;
+            }
+        }
+        
+        // CRITICAL: If CWD is home directory, VS Code didn't set workspace properly
+        // This is the core issue - VS Code runs MCP server with CWD=home when switching projects
+        if (process.cwd() === os.homedir()) {
+            console.error(`[CONVERSATION ERROR] CWD is home directory - VS Code MCP integration issue!`);
+            console.error(`[CONVERSATION ERROR] Cannot reliably detect workspace from home directory`);
+            console.error(`[CONVERSATION ERROR] This will cause conversation history to save in wrong location`);
+            
+            // Try to get workspace from VS Code's recently opened workspaces
+            const recentWorkspace = this.getRecentVSCodeWorkspace();
+            if (recentWorkspace) {
+                console.error(`[CONVERSATION] Using recent VS Code workspace: ${recentWorkspace}`);
+                return recentWorkspace;
+            }
+        }
+        
+        // Method 2: Analyze script path to infer project directory (MOST RELIABLE)
+        const scriptPath = process.argv[1]; // The index.js file path
+        console.error(`[CONVERSATION DEBUG] Script path: ${scriptPath}`);
+        if (scriptPath) {
+            // If script is in a project (e.g., /path/to/project/mcp-server/build/index.js)
+            let projectDir = path.dirname(scriptPath); // /path/to/project/mcp-server/build
+            
+            // Go up directories looking for project indicators
+            // Start by going up to the MCP server directory, then check its parent
+            for (let i = 0; i < 4; i++) { // Check up to 4 levels up
+                const parentDir = path.dirname(projectDir);
+                console.error(`[CONVERSATION DEBUG] Checking parent dir: ${parentDir}`);
+                
+                // Prefer broader workspace over narrow MCP server directory
+                // If current dir is valid but parent is also valid, choose parent
+                if (this.isValidWorkspace(parentDir)) {
+                    // Check if parent seems like a broader workspace
+                    const currentDirName = path.basename(projectDir);
+                    const parentDirName = path.basename(parentDir);
+                    
+                    // If current directory looks like an MCP server directory, prefer parent
+                    if (currentDirName.includes('mcp') || currentDirName.includes('server')) {
+                        console.error(`[CONVERSATION] Detected workspace from script path (parent preferred): ${parentDir}`);
+                        return parentDir;
+                    }
+                }
+                
+                if (this.isValidWorkspace(projectDir)) {
+                    console.error(`[CONVERSATION] Detected workspace from script path: ${projectDir}`);
+                    return projectDir;
+                }
+                
+                projectDir = parentDir;
+            }
+        }
+        
+        // Method 3: Search upward from current directory for workspace indicators
+        let currentDir = process.cwd();
+        const maxDepth = 10; // Prevent infinite loops
+        let depth = 0;
+
+        while (depth < maxDepth) {
+            if (this.isValidWorkspace(currentDir)) {
+                console.error(`[CONVERSATION] Found workspace at: ${currentDir}`);
+                return currentDir;
+            }
+
+            // Move up one directory
+            const parentDir = path.dirname(currentDir);
+            if (parentDir === currentDir) {
+                // Reached root directory
+                break;
+            }
+            currentDir = parentDir;
+            depth++;
+        }
+
+        // Method 4: If we're in home directory, try to find a reasonable default
+        if (process.cwd() === os.homedir()) {
+            // Look for common project directories in home
+            const commonProjectDirs = [
+                path.join(os.homedir(), 'Projects'),
+                path.join(os.homedir(), 'projects'),
+                path.join(os.homedir(), 'workspace'),
+                path.join(os.homedir(), 'Development'),
+                path.join(os.homedir(), 'dev')
+            ];
+            
+            for (const projectsDir of commonProjectDirs) {
+                if (fs.existsSync(projectsDir)) {
+                    console.error(`[CONVERSATION] Found projects directory: ${projectsDir}, but no specific project detected`);
+                    // Don't return this - it's too broad
+                    break;
+                }
+            }
+        }
+
+        // Fallback to current working directory
+        console.error(`[CONVERSATION] No workspace found, using CWD: ${process.cwd()}`);
+        const fallbackDir = process.cwd();
+        console.error(`[CONVERSATION DEBUG] Final workspace path will be: ${path.join(fallbackDir, '.mcp-conversation-history.json')}`);
+        return fallbackDir;
+    }
+
+    private getRecentVSCodeWorkspace(): string | null {
+        try {
+            // Method 1: Try to read VS Code's current workspace from storage
+            const vscodeDir = path.join(os.homedir(), 'Library/Application Support/Code/User');
+            const recentlyOpenedPath = path.join(vscodeDir, 'globalStorage/storage.json');
+            
+            if (fs.existsSync(recentlyOpenedPath)) {
+                const storage = JSON.parse(fs.readFileSync(recentlyOpenedPath, 'utf8'));
+                const recentlyOpened = storage?.['history.recentlyOpenedPathsList'];
+                
+                if (recentlyOpened?.entries && Array.isArray(recentlyOpened.entries)) {
+                    // Get the most recently opened folder (not file)
+                    for (const entry of recentlyOpened.entries) {
+                        if (entry.folderUri && entry.folderUri.startsWith('file://')) {
+                            const workspacePath = entry.folderUri.replace('file://', '');
+                            if (fs.existsSync(workspacePath) && this.isValidWorkspace(workspacePath)) {
+                                console.error(`[CONVERSATION] Found recent workspace: ${workspacePath}`);
+                                return workspacePath;
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // Method 2: Try to read from VS Code's workspace state
+            const workspaceStoragePath = path.join(vscodeDir, 'workspaceStorage');
+            if (fs.existsSync(workspaceStoragePath)) {
+                const workspaceDirs = fs.readdirSync(workspaceStoragePath);
+                
+                // Find the most recently modified workspace directory
+                let mostRecentWorkspace = null;
+                let mostRecentTime = 0;
+                
+                for (const workspaceDir of workspaceDirs) {
+                    const workspacePath = path.join(workspaceStoragePath, workspaceDir);
+                    const workspaceJsonPath = path.join(workspacePath, 'workspace.json');
+                    
+                    if (fs.existsSync(workspaceJsonPath)) {
+                        const stats = fs.statSync(workspaceJsonPath);
+                        if (stats.mtime.getTime() > mostRecentTime) {
+                            try {
+                                const workspaceConfig = JSON.parse(fs.readFileSync(workspaceJsonPath, 'utf8'));
+                                if (workspaceConfig.folder) {
+                                    const folderPath = workspaceConfig.folder.replace('file://', '');
+                                    if (fs.existsSync(folderPath) && this.isValidWorkspace(folderPath)) {
+                                        mostRecentWorkspace = folderPath;
+                                        mostRecentTime = stats.mtime.getTime();
+                                    }
+                                }
+                            } catch (error) {
+                                // Skip invalid workspace files
+                            }
+                        }
+                    }
+                }
+                
+                if (mostRecentWorkspace) {
+                    console.error(`[WORKSPACE] Found current workspace from storage: ${mostRecentWorkspace}`);
+                    return mostRecentWorkspace;
+                }
+            }
+        } catch (error) {
+            console.error(`[CONVERSATION] Error reading VS Code workspace: ${error}`);
+        }
+        
+        return null;
+    }
+
+    private isValidWorkspace(dirPath: string): boolean {
+        if (!fs.existsSync(dirPath)) return false;
+        
+        // Check for common workspace/project indicators
+        const indicators = [
+            'package.json',
+            '.git',
+            '.vscode',
+            'tsconfig.json',
+            'README.md',
+            'Cargo.toml',
+            'go.mod',
+            'requirements.txt',
+            'pom.xml',
+            '.gitignore'
+        ];
+
+        return indicators.some(indicator => 
+            fs.existsSync(path.join(dirPath, indicator))
+        );
     }
 
     async addEntry(entry: Omit<ConversationEntry, 'timestamp'>): Promise<void> {
@@ -135,6 +396,7 @@ class ConversationHistoryManager {
             timestamp: new Date()
         };
         
+        console.error(`[CONVERSATION DEBUG] Adding entry: ${entry.tool} - ${entry.query.substring(0, 50)}...`);
         this.history.unshift(newEntry);
         
         // Keep only recent entries to prevent memory bloat
@@ -142,13 +404,17 @@ class ConversationHistoryManager {
             this.history = this.history.slice(0, this.MAX_HISTORY_ENTRIES);
         }
         
+        console.error(`[CONVERSATION DEBUG] About to persist to: ${this.HISTORY_FILE}`);
         await this.persistHistory();
+        console.error(`[CONVERSATION DEBUG] Persist completed`);
     }
 
     getRelevantHistory(query: string, tool: string, maxEntries: number = 5): ConversationEntry[] {
+        // First get fresh entries, then filter by relevance
+        const freshEntries = this.getRecentHistory(10); // Get more fresh entries for filtering
         const keywords = this.extractKeywords(query);
         
-        return this.history
+        return freshEntries
             .filter(entry => {
                 // Include same-tool conversations with higher priority
                 const toolMatch = entry.tool === tool ? 2 : 1;
@@ -181,11 +447,26 @@ class ConversationHistoryManager {
         try {
             if (fs.existsSync(this.HISTORY_FILE)) {
                 const data = await fsPromises.readFile(this.HISTORY_FILE, 'utf8');
-                this.history = JSON.parse(data).map((entry: any) => ({
+                const allEntries = JSON.parse(data).map((entry: any) => ({
                     ...entry,
                     timestamp: new Date(entry.timestamp)
                 }));
-                console.error(`[CONVERSATION] Loaded ${this.history.length} conversation entries`);
+                
+                // Filter out old entries to prevent stale context
+                const cutoffDate = new Date();
+                cutoffDate.setHours(cutoffDate.getHours() - this.MAX_AGE_HOURS);
+                
+                this.history = allEntries.filter((entry: ConversationEntry) => 
+                    entry.timestamp > cutoffDate
+                );
+                
+                console.error(`[CONVERSATION] Loaded ${this.history.length} recent conversation entries (filtered from ${allEntries.length} total)`);
+                
+                // If we filtered out entries, persist the cleaned history
+                if (allEntries.length !== this.history.length) {
+                    await this.persistHistory();
+                    console.error(`[CONVERSATION] Cleaned up ${allEntries.length - this.history.length} old entries`);
+                }
             }
         } catch (error) {
             console.error('[CONVERSATION] Failed to load conversation history:', error);
@@ -195,13 +476,38 @@ class ConversationHistoryManager {
 
     private async persistHistory(): Promise<void> {
         try {
+            console.error(`[CONVERSATION DEBUG] Persisting ${this.history.length} entries to: ${this.HISTORY_FILE}`);
             await fsPromises.writeFile(
                 this.HISTORY_FILE, 
                 JSON.stringify(this.history, null, 2)
             );
+            console.error(`[CONVERSATION DEBUG] Successfully persisted conversation history`);
         } catch (error) {
             console.error('[CONVERSATION] Failed to persist conversation history:', error);
         }
+    }
+
+    getRecentHistory(limit: number = 10): ConversationEntry[] {
+        // Only return entries from recent hours to ensure freshness
+        const freshnessCutoff = new Date();
+        freshnessCutoff.setHours(freshnessCutoff.getHours() - this.CONTEXT_FRESHNESS_HOURS);
+        
+        const freshEntries = this.history.filter(entry => entry.timestamp > freshnessCutoff);
+        return freshEntries.slice(0, limit);
+    }
+
+    getContextSummary(): string {
+        const recentEntries = this.getRecentHistory(5);
+        if (recentEntries.length === 0) {
+            return "No recent conversation history in this workspace.";
+        }
+        
+        const summary = recentEntries.map(entry => {
+            const timeAgo = Math.round((Date.now() - entry.timestamp.getTime()) / (1000 * 60));
+            return `${timeAgo}m ago: ${entry.tool} (${entry.provider}) - "${entry.query.substring(0, 100)}..."`;
+        }).join('\n');
+        
+        return `Recent conversation context (last ${this.CONTEXT_FRESHNESS_HOURS}h):\n${summary}`;
     }
 }
 
@@ -218,9 +524,13 @@ class ContextManager {
 
         // Refresh project context
         try {
-            const readme = await this.readFileIfExists('README.md');
-            const packageJson = await this.readFileIfExists('package.json');
-            const structure = await this.getProjectStructure();
+            // Get the current workspace directory
+            const workspaceDir = this.getCurrentWorkspaceDir();
+            console.error(`[CONTEXT] Loading project context from: ${workspaceDir}`);
+            
+            const readme = await this.readFileIfExists(path.join(workspaceDir, 'README.md'));
+            const packageJson = await this.readFileIfExists(path.join(workspaceDir, 'package.json'));
+            const structure = await this.getProjectStructure(workspaceDir);
 
             this.projectContext = {
                 readme: readme || 'No README.md found',
@@ -274,10 +584,13 @@ class ContextManager {
         return [...new Set(relevantFiles)]; // Remove duplicates
     }
 
-    async buildFullContext(query: string, tool: string, conversationHistory: ConversationEntry[]): Promise<string> {
+    async buildFullContext(query: string, tool: string, conversationHistory: ConversationHistoryManager): Promise<string> {
         const projectContext = await this.getProjectContext();
         const relevantFiles = await this.discoverRelevantFiles(query);
         const fileContents = await this.readRelevantFileContents(relevantFiles);
+        
+        // Get only fresh conversation history to prevent stale context
+        const freshHistory = conversationHistory.getRecentHistory(5);
         
         let context = `# PROJECT CONTEXT
 
@@ -288,7 +601,7 @@ ${this.summarizeProject(projectContext)}
 ${fileContents}
 
 ## Recent Conversation History
-${this.formatConversationHistory(conversationHistory)}
+${this.formatConversationHistory(freshHistory)}
 
 ## Current Query
 Tool: ${tool}
@@ -306,9 +619,27 @@ Query: ${query}
         return context;
     }
 
+    public clearProjectContext(): void {
+        this.projectContext = null;
+        console.error('[CONTEXT] Cleared cached project context');
+    }
+
     estimateTokenCount(text: string): number {
         // Rough estimate: ~4 characters per token
         return Math.ceil(text.length / 4);
+    }
+
+    private getCurrentWorkspaceDir(): string {
+        // Get workspace from WorkspaceManager if set
+        const dynamicWorkspace = WorkspaceManager.getInstance().getCurrentWorkspace();
+        if (dynamicWorkspace) {
+            console.error(`[CONTEXT] Using workspace from WorkspaceManager: ${dynamicWorkspace}`);
+            return dynamicWorkspace;
+        }
+        
+        // Final fallback to current working directory
+        console.error(`[CONTEXT] No workspace set, using CWD: ${process.cwd()}`);
+        return process.cwd();
     }
 
     private async readFileIfExists(filePath: string): Promise<string | null> {
@@ -328,10 +659,11 @@ Query: ${query}
         }
     }
 
-    private async getProjectStructure(): Promise<string> {
+    private async getProjectStructure(workspaceDir: string = process.cwd()): Promise<string> {
         try {
             // Simple project structure - just list main directories and files
-            const items = await fsPromises.readdir('.', { withFileTypes: true });
+            console.error(`[CONTEXT] Reading project structure from: ${workspaceDir}`);
+            const items = await fsPromises.readdir(workspaceDir, { withFileTypes: true });
             const structure = items
                 .filter(item => !item.name.startsWith('.') || ['.github', '.vscode'].includes(item.name))
                 .map(item => item.isDirectory() ? `${item.name}/` : item.name)
@@ -340,6 +672,7 @@ Query: ${query}
             
             return structure;
         } catch (error) {
+            console.error(`[CONTEXT] Error reading project structure from ${workspaceDir}:`, error);
             return 'Error reading project structure';
         }
     }
@@ -662,6 +995,20 @@ class AICollaborationServer {
                             },
                             required: ["command", "tool_name"]
                         }
+                    },
+                    {
+                        name: "set_workspace",
+                        description: "Set the current workspace directory for conversation history. This should be called when VS Code switches to a different project.",
+                        inputSchema: {
+                            type: "object",
+                            properties: {
+                                workspace_path: {
+                                    type: "string",
+                                    description: "The absolute path to the current workspace/project directory"
+                                }
+                            },
+                            required: ["workspace_path"]
+                        }
                     }
                 ]
             };
@@ -670,6 +1017,16 @@ class AICollaborationServer {
         // Handle tool calls - only the essential tools
         this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
             try {
+                // CRITICAL: Extract workspace from VS Code context if available
+                // When VS Code uses @workspace, it should provide context about the current workspace
+                const workspaceFromContext = this.extractWorkspaceFromRequest(request);
+                if (workspaceFromContext) {
+                    console.error(`[WORKSPACE] Auto-detected workspace from VS Code context: ${workspaceFromContext}`);
+                    WorkspaceManager.getInstance().setWorkspace(workspaceFromContext);
+                    // Reinitialize conversation history with correct workspace
+                    this.conversationHistory = new ConversationHistoryManager();
+                }
+                
                 switch (request.params.name) {
                     case "consult_ai":
                         return await this.consultAI(request.params.arguments);
@@ -679,6 +1036,9 @@ class AICollaborationServer {
                     
                     case "mandatory_execute":
                         return await this.mandatoryExecute(request.params.arguments);
+                    
+                    case "set_workspace":
+                        return await this.setWorkspace(request.params.arguments);
                     
                     default:
                         throw new Error(`Unknown tool: ${request.params.name}`);
@@ -775,8 +1135,7 @@ class AICollaborationServer {
 
         try {
             // Build enhanced context with conversation history and project context
-            const conversationHistory = this.conversationHistory.getRelevantHistory(prompt, toolName);
-            const enhancedContext = await this.contextManager.buildFullContext(prompt, toolName, conversationHistory);
+            const enhancedContext = await this.contextManager.buildFullContext(prompt, toolName, this.conversationHistory);
             
             // Combine user-provided context with enhanced context
             const fullPrompt = context 
@@ -828,8 +1187,7 @@ class AICollaborationServer {
         const toolName = 'multi_ai_research';
         
         // Build enhanced context once for all providers
-        const conversationHistory = this.conversationHistory.getRelevantHistory(research_question, toolName);
-        const enhancedContext = await this.contextManager.buildFullContext(research_question, toolName, conversationHistory);
+        const enhancedContext = await this.contextManager.buildFullContext(research_question, toolName, this.conversationHistory);
         
         const results: string[] = [];
         const responses: Array<{ provider: string; response: string }> = [];
@@ -887,6 +1245,23 @@ class AICollaborationServer {
             });
         }
         
+        // Store conversation history for successful responses
+        const successfulResponses = responses.filter(r => !r.response.includes('❌'));
+        if (successfulResponses.length > 0) {
+            try {
+                await this.conversationHistory.addEntry({
+                    tool: toolName,
+                    provider: 'multiple',
+                    query: research_question,
+                    response: results.join('\n'),
+                    contextFiles: [],
+                    tokenCount: this.contextManager.estimateTokenCount(research_question + results.join('\n'))
+                });
+            } catch (error) {
+                console.error('[MULTI_AI_RESEARCH] Failed to save conversation history:', error);
+            }
+        }
+        
         return {
             content: [
                 {
@@ -935,6 +1310,167 @@ class AICollaborationServer {
                 ]
             };
         }
+    }
+
+    private extractWorkspaceFromRequest(request: any): string | null {
+        try {
+            // Check various places where VS Code might pass workspace information
+            console.error(`[WORKSPACE DEBUG] Full request:`, JSON.stringify(request, null, 2));
+            
+            // Method 1: Check request meta/context
+            if (request.meta?.workspaceFolder) {
+                console.error(`[WORKSPACE] Found in request.meta.workspaceFolder: ${request.meta.workspaceFolder}`);
+                return request.meta.workspaceFolder;
+            }
+            
+            // Method 2: Check request params context
+            if (request.params?.context?.workspaceFolder) {
+                console.error(`[WORKSPACE] Found in request.params.context.workspaceFolder: ${request.params.context.workspaceFolder}`);
+                return request.params.context.workspaceFolder;
+            }
+            
+            // Method 3: Check arguments for workspace hints
+            if (request.params?.arguments?.context) {
+                const contextStr = JSON.stringify(request.params.arguments.context);
+                console.error(`[WORKSPACE DEBUG] Context string: ${contextStr}`);
+                
+                // Look for file paths that might indicate workspace
+                const filePathMatch = contextStr.match(/file:\/\/([^"]+)/);
+                if (filePathMatch) {
+                    const filePath = filePathMatch[1];
+                    console.error(`[WORKSPACE DEBUG] Found file path: ${filePath}`);
+                    
+                    // Extract workspace root from file path
+                    let dir = path.dirname(filePath);
+                    while (dir && dir !== '/' && dir !== os.homedir()) {
+                        if (this.isValidWorkspaceDir(dir)) {
+                            console.error(`[WORKSPACE] Detected workspace from file path: ${dir}`);
+                            return dir;
+                        }
+                        dir = path.dirname(dir);
+                    }
+                }
+                
+                // NEW: Try to infer workspace from context content patterns
+                // Look for project-specific terms or paths that might hint at the workspace
+                const contextLower = contextStr.toLowerCase();
+                
+                // Check for common project patterns in context
+                const projectPatterns = [
+                    /\/([^\/]+)\/(src|lib|components|pages|app)/i,
+                    /project[:\s]+([^,\s]+)/i,
+                    /workspace[:\s]+([^,\s]+)/i,
+                    /working on[:\s]+([^,\s]+)/i
+                ];
+                
+                for (const pattern of projectPatterns) {
+                    const match = contextStr.match(pattern);
+                    if (match && match[1]) {
+                        const projectHint = match[1];
+                        console.error(`[WORKSPACE DEBUG] Found project hint: ${projectHint}`);
+                        
+                        // Try to find this project in common locations
+                        const possiblePaths = [
+                            path.join(os.homedir(), 'Projects', projectHint),
+                            path.join(os.homedir(), 'projects', projectHint),
+                            path.join(os.homedir(), 'Development', projectHint),
+                            path.join(os.homedir(), 'dev', projectHint),
+                            path.join(os.homedir(), projectHint)
+                        ];
+                        
+                        for (const possiblePath of possiblePaths) {
+                            if (fs.existsSync(possiblePath) && this.isValidWorkspaceDir(possiblePath)) {
+                                console.error(`[WORKSPACE] Found workspace from context hint: ${possiblePath}`);
+                                return possiblePath;
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // Method 4: Check for environment variables set by this request
+            const envWorkspace = process.env.VSCODE_WORKSPACE_FOLDER || process.env.WORKSPACE_FOLDER;
+            if (envWorkspace && envWorkspace !== '/' && fs.existsSync(envWorkspace)) {
+                console.error(`[WORKSPACE] Found in environment: ${envWorkspace}`);
+                return envWorkspace;
+            }
+            
+            console.error(`[WORKSPACE DEBUG] No workspace found in request context`);
+            return null;
+            
+        } catch (error) {
+            console.error(`[WORKSPACE ERROR] Error extracting workspace: ${error}`);
+            return null;
+        }
+    }
+
+    private isValidWorkspaceDir(dirPath: string): boolean {
+        if (!fs.existsSync(dirPath)) return false;
+        
+        // Check for common workspace/project indicators
+        const indicators = [
+            'package.json',
+            '.git',
+            'pyproject.toml',
+            'requirements.txt',
+            'Cargo.toml',
+            'pom.xml',
+            'build.gradle',
+            'composer.json',
+            'go.mod',
+            '.vscode',
+            'tsconfig.json'
+        ];
+        
+        return indicators.some(indicator => 
+            fs.existsSync(path.join(dirPath, indicator))
+        );
+    }
+
+    private async setWorkspace(args: any): Promise<any> {
+        const { workspace_path } = args;
+        
+        if (!workspace_path) {
+            return {
+                content: [
+                    {
+                        type: "text",
+                        text: "❌ **Set Workspace Error**\n\nMissing required parameter: workspace_path"
+                    }
+                ]
+            };
+        }
+        
+        if (!fs.existsSync(workspace_path)) {
+            return {
+                content: [
+                    {
+                        type: "text",
+                        text: `❌ **Set Workspace Error**\n\nWorkspace path does not exist: ${workspace_path}`
+                    }
+                ]
+            };
+        }
+        
+        // Set the workspace using the WorkspaceManager
+        WorkspaceManager.getInstance().setWorkspace(workspace_path);
+        
+        // Reinitialize the conversation history manager with the new workspace
+        this.conversationHistory = new ConversationHistoryManager();
+        
+        // Force refresh the project context with the new workspace
+        this.contextManager.clearProjectContext();
+        
+        console.error(`[WORKSPACE] Successfully set workspace to: ${workspace_path}`);
+        
+        return {
+            content: [
+                {
+                    type: "text",
+                    text: `✅ **Workspace Set Successfully**\n\nConversation history will now be saved to:\n\`${path.join(workspace_path, '.mcp-conversation-history.json')}\`\n\nAll future AI interactions will use this workspace-specific conversation history.`
+                }
+            ]
+        };
     }
 
     /**

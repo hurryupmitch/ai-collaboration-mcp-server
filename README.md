@@ -5,36 +5,45 @@ A streamlined Model Context Protocol (MCP) server that provides enhanced AI coll
 ## 🚀 Features
 
 - **Multi-Provider Support**: Claude, GPT-4, Gemini, and Ollama
+- **Workspace-Specific Conversation History**: Each project gets isolated conversation memory
 - **Automatic Context Injection**: Project files, structure, and README automatically included
-- **Conversation History**: Persistent conversation memory across sessions
+- **Dynamic Workspace Management**: Switch between projects seamlessly
 - **API Call Management**: Rate limiting (3 calls per provider per hour)
-- **Streamlined Tools**: Just 3 essential tools instead of complex tool proliferation
+- **Streamlined Tools**: Just 4 essential tools that work together
 
 ## 🛠️ Tools Available
 
-### 1. `consult_ai`
+### 1. `#set_workspace`
+Set the current workspace directory for project-specific conversation history and context.
+
+**Usage in VS Code:**
+```
+@workspace use #set_workspace with workspace_path="/path/to/your/project"
+```
+
+### 2. `#consult_ai`
 Get expert advice from a specific AI provider with full project context.
 
 **Usage in VS Code:**
 ```
-@workspace use consult_ai with claude about error handling best practices
+@workspace use #consult_ai with claude about error handling best practices
 ```
 
-### 2. `multi_ai_research` 
+### 3. `#multi_ai_research` 
 Get perspectives from multiple AI providers on complex questions.
 
 **Usage in VS Code:**
 ```
-@workspace use multi_ai_research to analyze authentication approaches
+@workspace use #multi_ai_research to analyze authentication approaches
 ```
 
-### 3. `mandatory_execute`
+### 4. `#mandatory_execute`
 Force tool execution with explicit commands.
 
 **Usage in VS Code:**
 ```
 @workspace !consult_ai
-@workspace use multi_ai_research
+@workspace use #multi_ai_research
 ```
 
 ## 📦 Installation
@@ -124,12 +133,37 @@ Add to your VS Code `settings.json`:
 
 ## 🎯 Usage
 
+### First Time Setup Per Project:
 1. **Restart VS Code** after configuration
 2. **Open VS Code chat** (sidebar or `Cmd+Shift+I`)
-3. **Use the tools:**
-   - `@workspace use consult_ai with claude about my code`
-   - `@workspace use multi_ai_research to compare approaches`
+3. **Set workspace for your project:**
+   ```
+   @workspace use #set_workspace with workspace_path="/full/path/to/your/project"
+   ```
+
+### Daily Usage:
+4. **Use the AI tools:**
+   - `@workspace use #consult_ai with claude about my code`
+   - `@workspace use #multi_ai_research to compare approaches`
    - `@workspace !consult_ai` (force execution)
+
+### When Switching Projects:
+5. **Set new workspace:**
+   ```
+   @workspace use #set_workspace with workspace_path="/path/to/other/project"
+   ```
+
+**💡 Tip**: Each project gets its own `.mcp-conversation-history.json` file for isolated conversation memory.
+
+## ⚠️ **Important Syntax Note**
+
+When using `@workspace` in VS Code, MCP tool names **must** be prefixed with `#`:
+
+✅ **Correct**: `@workspace use #consult_ai with claude about my code`  
+❌ **Wrong**: `@workspace use consult_ai with claude about my code`
+
+Without `@workspace`, no `#` is needed:
+✅ **Also correct**: `use consult_ai with claude about my code`
 
 ## 🔧 Development
 
