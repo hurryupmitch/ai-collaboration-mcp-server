@@ -752,7 +752,7 @@ A: ${entry.response.slice(0, 300)}${entry.response.length > 300 ? '...' : ''}
 
 class ProviderCallManager {
     private callTrackers: Map<string, ProviderCallTracker> = new Map();
-    private readonly MAX_CALLS_PER_PROVIDER = 3;
+    private readonly MAX_CALLS_PER_PROVIDER = 6;
     private readonly RESET_INTERVAL = 60 * 60 * 1000; // 1 hour
 
     constructor() {
@@ -954,13 +954,13 @@ class AICollaborationServer {
                     },
                     {
                         name: "multi_ai_research",
-                        description: "Get perspectives from multiple AI providers on a research question. Enhanced with full project context and conversation history shared across all providers.",
+                        description: "Get comprehensive perspectives from ALL AI providers automatically (Claude, GPT-4, Gemini, Ollama). DO NOT specify providers parameter unless you want to limit to specific AIs only. Enhanced with full project context and conversation history.",
                         inputSchema: {
                             type: "object",
                             properties: {
                                 research_question: {
                                     type: "string",
-                                    description: "The research question to investigate"
+                                    description: "The research question to investigate across all AI providers"
                                 },
                                 providers: {
                                     type: "array",
@@ -968,7 +968,7 @@ class AICollaborationServer {
                                         type: "string",
                                         enum: Object.keys(AI_PROVIDERS)
                                     },
-                                    description: "Which AI providers to consult (default: all available)"
+                                    description: "ONLY specify this if you want to limit research to specific providers. Leave blank for comprehensive multi-AI research across ALL providers."
                                 }
                             },
                             required: ["research_question"]
@@ -1127,7 +1127,7 @@ class AICollaborationServer {
                 content: [
                     {
                         type: "text",
-                        text: `## ❌ API Call Limit Reached for ${aiProvider.name}\n\n**Limit:** 3 calls per hour\n**Remaining:** ${remaining}\n\n**Suggestion:** Wait for limit reset or use a different provider.`
+                        text: `## ❌ API Call Limit Reached for ${aiProvider.name}\n\n**Limit:** 6 calls per hour\n**Remaining:** ${remaining}\n\n**Suggestion:** Wait for limit reset or use a different provider.`
                     }
                 ]
             };
@@ -1183,8 +1183,11 @@ class AICollaborationServer {
     }
 
     private async multiAIResearch(args: any): Promise<any> {
-        const { research_question, providers = Object.keys(AI_PROVIDERS) } = args;
+        const { research_question, providers } = args;
         const toolName = 'multi_ai_research';
+        
+        // ALWAYS query all providers by default - that's the point of multi-AI research!
+        const providersToUse = providers && providers.length > 0 ? providers : Object.keys(AI_PROVIDERS);
         
         // Build enhanced context once for all providers
         const enhancedContext = await this.contextManager.buildFullContext(research_question, toolName, this.conversationHistory);
@@ -1193,15 +1196,17 @@ class AICollaborationServer {
         const responses: Array<{ provider: string; response: string }> = [];
         
         console.error(`[MULTI_AI_RESEARCH] Starting research with enhanced context (${this.contextManager.estimateTokenCount(enhancedContext)} estimated tokens)`);
+        console.error(`[MULTI_AI_RESEARCH] Querying ${providersToUse.length} providers: ${providersToUse.join(', ')}`);
         
-        for (const providerKey of providers) {
+        for (const providerKey of providersToUse) {
             if (!AI_PROVIDERS[providerKey]) {
                 continue;
             }
             
             const provider = AI_PROVIDERS[providerKey];
             
-            if (!provider.apiKey) {
+            // Only check API key for cloud providers, not Ollama (local)
+            if (providerKey !== 'ollama' && !provider.apiKey) {
                 results.push(`**${provider.name}:** ❌ API key not configured`);
                 continue;
             }
